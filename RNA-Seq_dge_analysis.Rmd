@@ -1,0 +1,270 @@
+---
+title: "RNA-Seq differential gene expression analysis"
+author: "Chester Wang"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+### Introduction
+
+##### This report analyzes a count matrix generated from RNA-seq reads, which are obtained from Sequence Read Archive (SRA) of NCBI. The sequence reads are aligned to reference genome using STAR for reads quantification of each gene. The purpose of this analysis is to identify genes that are differentially expressed between groups under different conditions.
+
+### Part 1: Examine the data
+
+#### 1. Load the required packages
+
+```{r message=FALSE, warning=FALSE}
+library(DESeq2)
+library(pheatmap)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(EnhancedVolcano)
+library(clusterProfiler)
+library(tidyverse)
+library(RColorBrewer)
+```
+
+#### 2. Load the count matrix:
+
+```{r}
+counts <- read.table("data/counts.csv",
+                     header = TRUE, row.names = 1)
+counts <- counts[, -c(1:5)]
+counts <- counts[, c(1,2,9,3,4,5,6,7,8,10,11,12)]
+counts <- drop_na(counts)
+```
+
+#### 3. Create metadata:
+
+```{r}
+Condition <- c("Patient", "Patient", "Patient", 
+               "Treatment_1", "Treatment_1", "Treatment_1", 
+               "Treatment_2", "Treatment_2", "Treatment_2",
+               "Control", "Control", "Control")
+metadata <- data.frame(Condition)
+metadata$Condition <- as.factor(metadata$Condition)
+rownames(metadata) <- colnames(counts)
+```
+
+#### 4. Create DESeq2 object:
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = counts,
+                              colData = metadata,
+                              design =  ~ Condition)
+```
+
+#### 5. Identify sample outliers:
+
+##### The count data is first transformed to log2 scale to minimize differences between samples, and to normalize the data by library size. Replicates of samples are expected to cluster together and seperated by major principal components.
+
+##### **Unsupervised clustering analysis:** 
+
+```{r message=FALSE, warning=FALSE}
+rld <- rlog(dds, blind=TRUE)
+plotPCA(rld, intgroup="Condition")
+```
+
+##### **Hierarchical clustering analysis:**
+
+```{r}
+plot(hclust(dist(t(assay(rld)))), 
+     labels=colData(rld)$Condition,
+     main = NULL)
+```
+
+##### There are four samples with three biological replicates per sample. As shown in PCA and hierarchical clustering plots, the biological replicates of Treatment_1 do not cluster together, which could be due to experimental factors or other issues. Therefore, Treatment_1 will be excluded in the following analysis.
+
+```{r}
+counts_rev <- counts[,c(10,11,12,1,2,3,7,8,9)]
+Condition_rev <- c("Control", "Control", "Control",
+                   "Patient", "Patient", "Patient", 
+                   "Treatment_2", "Treatment_2", "Treatment_2")
+metadata_rev <- data.frame(Condition_rev)
+metadata_rev$Condition_rev <- factor(metadata_rev$Condition_rev, 
+                                     levels = c("Control", "Patient",
+                                                "Treatment_2"))
+rownames(metadata_rev) <- colnames(counts_rev)
+
+dds_rev <- DESeqDataSetFromMatrix(countData = counts_rev,
+                                  colData = metadata_rev,
+                                  design =  ~ Condition_rev)
+```
+
+##### **Pair-wise hierarchical correlation heatmap:**
+
+```{r}
+vst <- vst(dds_rev, blind = TRUE)
+vst_cor <- cor(assay(vst))
+colnames(vst_cor) <- c("Control", "Control", "Control",
+                       "Patient", "Patient", "Patient", 
+                       "Treatment_2", "Treatment_2", "Treatment_2")
+rownames(vst_cor) <- c("Control", "Control", "Control",
+                       "Patient", "Patient", "Patient", 
+                       "Treatment_2", "Treatment_2", "Treatment_2")
+pheatmap(vst_cor,
+         treeheight_col = 24, treeheight_row = 24,
+         fontsize = 8, fontsize_row = 7.5, fontsize_col = 7.5)
+```
+
+##### Pair-wise hierarchical correlation heatmap indicates that the biological replicates of Control, Patient, and Treatment_2 sample groups cluster together in the revised dataset. In addition, the samples reveal high correlation in the heatmap, as the correlation coefficients are at least 0.97 or higher. Therefore, conditions of the samples can be used in differential gene expression analysis. 
+
+### Part 2: Differential gene expression analysis
+
+```{r}
+dds_rev <- DESeq(dds_rev)
+```
+
+#### 1. Explore data fit of the model:
+
+```{r}
+plotDispEsts(dds_rev)
+```
+
+##### In the dispersion plot, the dots follow the maximum likelihood line and the dispersion decreases as the mean of the normalized counts increases. Therefore, the data fit the model well. 
+
+#### 2. Identify differentially expressed genes:
+
+##### The condition of the samples identified in unsupervised clustering analysis is specified as the contrast factor for comparison. Results of comparing the Patient and Control groups are extracted to identify DEGs.
+
+```{r}
+res_pat_ctl <- results(dds_rev,
+                       contrast = c("Condition_rev", "Patient", "Control"),
+                       alpha = 0.05, lfcThreshold = 1)
+```
+
+##### **MA plot:**
+
+```{r}
+plotMA(res_pat_ctl, ylim=c(-10,10),
+       colSig="coral3", colNonSig="grey40", colLine="coral3")
+```
+
+#### 3. Incorporate gene annotation database:
+
+```{r message=FALSE, warning=FALSE}
+annot_res_pat_ctl <- AnnotationDbi::select(org.Hs.eg.db, 
+                                           keys = rownames(res_pat_ctl),
+                                           columns = c("SYMBOL","GENENAME"),
+                                           keytype="ENSEMBL")
+
+res_pat_ctl_ENSEMBL <- data.frame(res_pat_ctl) %>%
+  mutate(ENSEMBL = rownames(res_pat_ctl)) %>%
+  mutate(Regulation = ifelse(log2FoldChange > 0, "Up", "Down"))
+
+annot_res_pat_ctl <- annot_res_pat_ctl %>%
+  left_join(res_pat_ctl_ENSEMBL) %>% 
+  dplyr::select(, c(1,2,3,5,8,9,10)) %>%
+  drop_na()
+```
+
+#### 4. Identify top DEGs:
+
+```{r message=FALSE, warning=FALSE}
+res_pat_ctl_topgenes <- 
+  head(annot_res_pat_ctl[order(annot_res_pat_ctl$padj),], 40)
+```
+
+##### **Expression heatmap:**
+
+```{r, message=FALSE, warning=FALSE}
+normalized_counts <- counts(dds_rev, normalized = TRUE)
+normalized_counts_top <- normalized_counts[res_pat_ctl_topgenes$ENSEMBL,] %>%
+  as.data.frame() %>%
+  mutate(ENSEMBL = rownames(normalized_counts[res_pat_ctl_topgenes$ENSEMBL,])) %>%
+  left_join(annot_res_pat_ctl[rownames(res_pat_ctl_topgenes),])
+rownames(normalized_counts_top) <- normalized_counts_top$SYMBOL
+normalized_counts_top <- normalized_counts_top %>%
+  select(,-c(10,11,12,13,14,15,16))
+
+heat_colors <- brewer.pal(6, "YlOrRd")
+
+colnames(normalized_counts_top) <- c("Control", "Control", "Control",
+                                     "Patient", "Patient", "Patient", 
+                                     "Treatment_2", "Treatment_2", "Treatment_2")
+
+pheatmap(normalized_counts_top,
+         color = heat_colors, fontsize = 9,
+         cellheight = 7, fontsize_row = 7, fontsize_col = 9,
+         treeheight_col = 15, treeheight_row = 15,
+         cluster_rows = T, cluster_rownames = F,
+         scale = "row")
+```
+
+##### **Volcano plot:**
+
+```{r, fig.height=8, fig.width=6}
+EnhancedVolcano(annot_res_pat_ctl,
+                lab = annot_res_pat_ctl$SYMBOL,
+                x = "log2FoldChange", y = "padj",
+                title = "Patient vs Control",
+                FCcutoff = 3,  pCutoff = 10e-20,
+                pointSize = 1.5, labSize = 3,
+                axisLabSize = 13,
+                col = c("gray20", "gray30", "coral4", "coral3"),
+                selectLab = head(res_pat_ctl_topgenes$SYMBOL,30),
+                boxedLabels = TRUE,  
+                drawConnectors = TRUE,
+                widthConnectors = 0.5,
+                colConnectors = 'black',
+                legendLabSize = 13, legendIconSize = 2.5,
+                colAlpha = 1, 
+                cutoffLineType = 'blank', cutoffLineCol = 'black',
+                cutoffLineWidth = 0.8,
+                hline = c(10e-20,
+                          10e-20 * 10e-80,
+                          10e-20 * 10e-140,
+                          10e-20 * 10e-200),
+                hlineCol = c('burlywood3', 'burlywood3', 'burlywood3',
+                             'burlywood3'),
+                hlineType = c('dashed', 'dashed', 'dashed', 'dashed'),
+                hlineWidth = c(1, 1, 1, 1),
+                vline = c(-3, 3),
+                vlineCol = c("gray60"),
+                vlineType = c("dashed"),
+                vlineWidth = c(1),
+                gridlines.major = FALSE,
+                gridlines.minor = FALSE,
+                xlim = c(-10,10))
+```
+
+##### **Expression plot:**
+
+```{r}
+top_40_pat_ctl <- head(normalized_counts_top, 40)
+colnames(top_40_pat_ctl) <- colnames(counts_rev)
+top_40_pat_ctl <- top_40_pat_ctl %>%
+  mutate(SYMBOL = rownames(head(normalized_counts_top, 40))) %>%
+  pivot_longer(cols = colnames(counts_rev),
+               names_to = "samplename",
+               values_to = "normalized_counts")
+metadata_pat_ctl <- data.frame(rownames_to_column(metadata_rev, var="samplename"))
+top_40_pat_ctl <- inner_join(top_40_pat_ctl, metadata_pat_ctl, by="samplename")
+
+ggplot(top_40_pat_ctl) + 
+  geom_point(aes(x=SYMBOL, y=normalized_counts, col=Condition_rev)) +
+  scale_y_log10() +
+  xlab("Genes") + ylab("Normalized Counts") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=45, hjust=1, size=6),
+        axis.title.y = element_text(margin=margin(l=5, r=10)),
+        legend.title = element_blank(),
+        legend.text = element_text(size=9),
+        axis.title = element_text(size=9))
+```
+
+##### **Gene ontology analysis:**
+
+```{r}
+sigs_up <- annot_res_pat_ctl[annot_res_pat_ctl$log2FoldChange > 0.5,]$SYMBOL
+GO_res_up <- enrichGO(gene = sigs_up, OrgDb = "org.Hs.eg.db",
+                      keyType = "SYMBOL", ont = "BP")
+barplot(GO_res_up, showCategory = 20, label_format = 50, font.size = 10)
+```
+
+### Conclusion:
+
+##### Differential gene expression analysis using the Wald test for pair-wise comparison between sample groups was conducted in this report. While a list of DEGs was identified in this analysis, further experimental validation is required to determine biological significance of these genes. As shown in this analysis, the top DEGs identified are upregulated under the experimental condition. The effects of treatment on these genes will be included in future analyses.
+
+
+
